@@ -4,6 +4,12 @@ Real-time teleoperation of a **Universal Robots UR10** arm using a **Meta Quest 
 
 ---
 
+## Demo
+
+[![UR10 × Meta Quest 3 Teleoperation Demo](https://img.youtube.com/vi/TnU2DyegUVs/maxresdefault.jpg)](https://www.youtube.com/watch?v=TnU2DyegUVs)
+
+---
+
 ## How It Works
 
 ```
