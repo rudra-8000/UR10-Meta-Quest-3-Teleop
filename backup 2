@@ -1,0 +1,141 @@
+<script>
+/* ─── Config ─────────────────────────────────────────────────── */
+const WS_URL        = `wss://${window.location.host}/ws`;
+const SEND_HZ       = 90;   // target send rate
+const SEND_INTERVAL = 1000 / SEND_HZ;
+
+/* ─── State ─────────────────────────────────────────────────── */
+let ws         = null;
+let xrSession  = null;
+let refSpace   = null;
+let lastSendTs = 0;
+
+/* ─── Helpers ────────────────────────────────────────────────── */
+function setDot(id, cls) {
+  document.getElementById(id).className = 'dot' + (cls ? ' ' + cls : '');
+}
+function setText(id, txt) { document.getElementById(id).textContent = txt; }
+function log(msg) {
+  const el = document.getElementById('log');
+  const t  = new Date().toLocaleTimeString();
+  el.innerHTML = `<div>[${t}] ${msg}</div>` + el.innerHTML.slice(0, 1200);
+}
+
+/* ─── WebSocket ─────────────────────────────────────────────── */
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen  = () => { setDot('d-ws','ok');  setText('l-ws','WebSocket: connected');
+                       document.getElementById('btn-xr').disabled = false;  log('WS connected'); };
+  ws.onclose = () => { setDot('d-ws','');    setText('l-ws','WebSocket: reconnecting…');
+                       document.getElementById('btn-xr').disabled = true;
+                       setTimeout(connectWS, 2000); log('WS closed, retrying…'); };
+  ws.onerror = () => log('WS error');
+}
+
+/* ─── XR session ────────────────────────────────────────────── */
+document.getElementById('btn-xr').onclick = async () => {
+  if (!navigator.xr) { log('WebXR not available'); return; }
+
+  const modes = ['immersive-ar', 'immersive-vr'];
+  let mode = null;
+  for (const m of modes) {
+    if (await navigator.xr.isSessionSupported(m)) { mode = m; break; }
+  }
+  if (!mode) { log('No immersive XR mode supported on this device'); return; }
+
+  try {
+    xrSession = await navigator.xr.requestSession(mode, {
+      requiredFeatures: ['local-floor'],
+    });
+  } catch (e) {
+    // local-floor not always available, fall back to local
+    try {
+      xrSession = await navigator.xr.requestSession(mode, {
+        requiredFeatures: ['local'],
+      });
+      log('Fell back to local reference space');
+    } catch (e2) { log('XR session error: ' + e2.message); return; }
+  }
+
+  // Try floor space first, fall back to local
+  try {
+    refSpace = await xrSession.requestReferenceSpace('local-floor');
+  } catch (_) {
+    refSpace = await xrSession.requestReferenceSpace('local');
+  }
+
+  xrSession.addEventListener('end', () => {
+    setDot('d-xr', '');   setText('l-xr', 'XR: ended');
+    document.getElementById('btn-xr').disabled   = false;
+    document.getElementById('btn-stop').disabled = true;
+    xrSession = null; refSpace = null;
+    log('XR session ended');
+  });
+
+  setDot('d-xr', 'ok');
+  setText('l-xr', `XR: ${mode}`);
+  document.getElementById('btn-xr').disabled   = true;
+  document.getElementById('btn-stop').disabled = false;
+  log(`XR session started (${mode})`);
+  xrSession.requestAnimationFrame(onFrame);
+};
+
+document.getElementById('btn-stop').onclick = () => { if (xrSession) xrSession.end(); };
+
+/* ─── Per-frame controller read ─────────────────────────────── */
+function readController(frame, src) {
+  if (!src.gripSpace) return null;
+  const pose = frame.getPose(src.gripSpace, refSpace);
+  if (!pose) return null;
+  const t  = pose.transform;
+  const gp = src.gamepad;
+  return {
+    // Position [x, y, z] in metres
+    pos:  [t.position.x,    t.position.y,    t.position.z],
+    // Orientation quaternion [x, y, z, w]  (scipy convention)
+    quat: [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w],
+    // Analogue values 0–1
+    trigger:    gp?.buttons[0]?.value   ?? 0,
+    grip:       gp?.buttons[1]?.value   ?? 0,
+    // Thumbstick axes (–1 to 1)
+    thumbstick: gp?.axes ? [gp.axes[2] ?? 0, gp.axes[3] ?? 0] : [0, 0],
+    // Face buttons: A/X = index 4,  B/Y = index 5
+    btn_a: gp?.buttons[4]?.pressed ?? false,
+    btn_b: gp?.buttons[5]?.pressed ?? false,
+  };
+}
+
+function onFrame(ts, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(onFrame);
+
+  let left = null, right = null;
+  for (const src of session.inputSources) {
+    if (src.handedness === 'left')  left  = readController(frame, src);
+    if (src.handedness === 'right') right = readController(frame, src);
+  }
+
+  const hasCtrl = left !== null || right !== null;
+  setDot('d-ctrl', hasCtrl ? 'ok' : 'warn');
+  setText('l-ctrl', hasCtrl ? 'Controllers: tracking' : 'Controllers: not detected');
+
+  if (left)  document.getElementById('p-left').textContent =
+    `L pos : [${left.pos.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  quat: [${left.quat.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  grip:${left.grip.toFixed(2)}  X:${left.btn_a?'■':'□'}  Y:${left.btn_b?'■':'□'}`;
+  if (right) document.getElementById('p-right').textContent =
+    `R pos : [${right.pos.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  quat: [${right.quat.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  trig:${right.trigger.toFixed(2)}  A:${right.btn_a?'■':'□'}  B:${right.btn_b?'■':'□'}`;
+
+  // Rate-limited send
+  if (ws?.readyState === WebSocket.OPEN && (ts - lastSendTs) >= SEND_INTERVAL) {
+    ws.send(JSON.stringify({ left, right, ts }));
+    lastSendTs = ts;
+  }
+}
+
+/* ─── Boot ──────────────────────────────────────────────────── */
+connectWS();
+log('Page loaded — both devices must be on the same WiFi');
+</script>

@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UR10 Quest Teleop</title>
+  <style>
+    body  { font-family: monospace; background: #0d1117; color: #c9d1d9;
+            display: flex; flex-direction: column; align-items: center; padding: 20px; margin: 0; }
+    h1   { color: #58a6ff; margin: 10px 0; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 15px; margin: 8px 0; width: 360px; }
+    .row  { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    .dot  { width: 10px; height: 10px; border-radius: 50%; background: #f85149; flex-shrink: 0; }
+    .dot.ok   { background: #3fb950; }
+    .dot.warn { background: #d29922; }
+    button     { background: #238636; color: #fff; border: none; border-radius: 6px;
+                 padding: 10px 16px; margin: 4px; font-size: 14px; cursor: pointer; width: 100%; }
+    button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+    button.red  { background: #da3633; }
+    button.blue { background: #1f6feb; }
+    pre   { font-size: 11px; color: #8b949e; line-height: 1.5; margin: 6px 0; }
+    #log  { max-height: 120px; overflow-y: auto; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>UR10 Quest Teleop</h1>
+
+  <div class="card">
+    <div class="row"><div class="dot" id="d-ws"></div><span id="l-ws">WebSocket: connecting…</span></div>
+    <div class="row"><div class="dot" id="d-xr"></div><span id="l-xr">XR: not started</span></div>
+    <div class="row"><div class="dot warn" id="d-ctrl"></div><span id="l-ctrl">Controllers: waiting…</span></div>
+    <div class="row" style="margin-top:8px">
+      <span style="font-size:12px;color:#8b949e">Sends/s: </span>
+      <span id="hz" style="font-size:12px;color:#58a6ff">0</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <!-- Step 1 -->
+    <button id="btn-xr">▶ Step 1 — Enter VR</button>
+    <!-- Step 2: only needed if controllers don't appear -->
+    <button id="btn-sleep" class="blue" disabled>⏸ Step 2 — Sleep &amp; wake (fixes controllers)</button>
+    <button id="btn-stop" class="red" disabled>■ Exit session</button>
+  </div>
+
+  <div class="card">
+    <strong>Live poses  <span style="font-size:11px;color:#8b949e">(updates in 2D view only)</span></strong>
+    <pre id="p-left">Left:  —</pre>
+    <pre id="p-right">Right: —</pre>
+  </div>
+
+  <div class="card">
+    <strong>Controls</strong>
+    <pre>Left  GRIP  (press)   → Calibrate / Reset reference
+Right TRIGGER (hold)  → Robot tracks right controller
+Right TRIGGER (rel.)  → Pause (hold position)</pre>
+  </div>
+
+  <div class="card"><strong>Log</strong><div id="log"></div></div>
+
+  <!-- Hidden canvas — REQUIRED by Meta's WebXR runtime to activate input -->
+  <canvas id="xr-canvas" style="display:none; width:1px; height:1px;"></canvas>
+
+<script>
+const WS_URL        = `wss://${window.location.host}/ws`;
+const SEND_INTERVAL = 1000 / 90;   // ~90 Hz
+
+/* ─── WebGL context (must exist before session starts) ──────────── */
+const canvas = document.getElementById('xr-canvas');
+let gl = canvas.getContext('webgl2', { xrCompatible: true })
+      || canvas.getContext('webgl',  { xrCompatible: true });
+
+if (!gl) {
+  document.getElementById('log').textContent = 'ERROR: WebGL not available';
+}
+
+/* ─── State ────────────────────────────────────────────────────── */
+let ws         = null;
+let xrSession  = null;
+let refSpace   = null;
+let lastSendTs = 0;
+let sendCount  = 0;
+let hzTimer    = null;
+
+/* ─── Helpers ───────────────────────────────────────────────────── */
+function setDot(id, cls) {
+  document.getElementById(id).className = 'dot' + (cls ? ' ' + cls : '');
+}
+function setText(id, txt) { document.getElementById(id).textContent = txt; }
+function log(msg) {
+  const el = document.getElementById('log');
+  const t  = new Date().toLocaleTimeString();
+  el.innerHTML = `<div>[${t}] ${msg}</div>` + el.innerHTML.slice(0, 2000);
+  console.log(`[${t}] ${msg}`);   // also visible in browser devtools
+}
+
+/* ─── WebSocket ─────────────────────────────────────────────────── */
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen  = () => {
+    setDot('d-ws','ok');
+    setText('l-ws','WebSocket: connected');
+    document.getElementById('btn-xr').disabled = false;
+    log('WS connected');
+  };
+  ws.onclose = () => {
+    setDot('d-ws','');
+    setText('l-ws','WebSocket: reconnecting…');
+    document.getElementById('btn-xr').disabled = true;
+    setTimeout(connectWS, 2000);
+  };
+  ws.onerror = () => log('WS error');
+}
+
+/* ─── XR session ────────────────────────────────────────────────── */
+document.getElementById('btn-xr').onclick = startXR;
+
+async function startXR() {
+  if (!navigator.xr) { log('WebXR not supported'); return; }
+
+  // Prefer immersive-vr; AR mode has less reliable controller support
+  const modes = ['immersive-vr', 'immersive-ar'];
+  let mode = null;
+  for (const m of modes) {
+    if (await navigator.xr.isSessionSupported(m)) { mode = m; break; }
+  }
+  if (!mode) { log('No immersive XR mode supported on this device'); return; }
+
+  // Try with local-floor, fall back to local
+  for (const refFeature of ['local-floor', 'local']) {
+    try {
+      xrSession = await navigator.xr.requestSession(mode, {
+        requiredFeatures: [refFeature],
+        optionalFeatures: ['hand-tracking', 'bounded-floor'],
+      });
+      log(`Session created (${mode}, ${refFeature})`);
+      break;
+    } catch(e) {
+      log(`${refFeature} failed: ${e.message}`);
+      if (refFeature === 'local') { log('Could not start XR session'); return; }
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════════
+     THE CRITICAL FIX:
+     Meta Quest's WebXR runtime will NOT register input sources unless
+     a valid XRWebGLLayer is set before the first animation frame.
+     Without this, inputsourceschange never fires.
+  ════════════════════════════════════════════════════════════════ */
+  try {
+    await gl.makeXRCompatible();
+    xrSession.updateRenderState({
+      baseLayer: new XRWebGLLayer(xrSession, gl, {
+        antialias: false,   // keep it cheap — we only need input, not rendering
+        alpha: true,
+      }),
+    });
+    log('XRWebGLLayer set ✓');
+  } catch(e) {
+    log(`WebGL layer error: ${e.message} — controllers may not work`);
+  }
+
+  // Reference space
+  try {
+    refSpace = await xrSession.requestReferenceSpace('local-floor');
+  } catch(_) {
+    refSpace = await xrSession.requestReferenceSpace('local');
+    log('Fell back to local reference space');
+  }
+
+  /* ── Input source events ───────────────────────────────────────── */
+  xrSession.addEventListener('inputsourceschange', (ev) => {
+    log(`inputsourceschange: +${ev.added.length} added, -${ev.removed.length} removed`
+        + ` → total: ${xrSession.inputSources.length}`);
+    for (const src of ev.added) {
+      log(`  ✓ [${src.handedness}] ${src.profiles[0] ?? 'unknown'}`
+          + ` gripSpace:${!!src.gripSpace} targetRay:${src.targetRayMode}`);
+    }
+    if (ev.added.length > 0) {
+      setDot('d-ctrl', 'warn');   // will go green once poses arrive
+      setText('l-ctrl', `Controllers registered (${xrSession.inputSources.length}), waiting for poses…`);
+    }
+  });
+
+  // selectstart fires on trigger press — even if inputsourceschange didn't fire
+  // Use it as a fallback to detect controller presence
+  xrSession.addEventListener('selectstart', (ev) => {
+    log(`selectstart on ${ev.inputSource.handedness} controller — trigger pressed`);
+  });
+  xrSession.addEventListener('squeezestart', (ev) => {
+    log(`squeezestart on ${ev.inputSource.handedness} controller — grip pressed`);
+  });
+
+  xrSession.addEventListener('end', () => {
+    setDot('d-xr',''); setText('l-xr','XR: ended');
+    document.getElementById('btn-xr').disabled   = false;
+    document.getElementById('btn-stop').disabled = true;
+    document.getElementById('btn-sleep').disabled = true;
+    xrSession = null; refSpace = null;
+    clearInterval(hzTimer);
+    log('XR session ended');
+  });
+
+  setDot('d-xr', 'ok');
+  setText('l-xr', `XR: ${mode} active`);
+  document.getElementById('btn-xr').disabled    = true;
+  document.getElementById('btn-stop').disabled  = false;
+  document.getElementById('btn-sleep').disabled = false;
+
+  // Hz counter
+  hzTimer = setInterval(() => {
+    setText('hz', sendCount);
+    sendCount = 0;
+  }, 1000);
+
+  log('*** SQUEEZE BOTH CONTROLLERS NOW ***');
+  log('If nothing happens after 5s → tap "Sleep & wake" button');
+  xrSession.requestAnimationFrame(onFrame);
+}
+
+/* ── Sleep/wake workaround button ────────────────────────────────── */
+// Puts the headset to sleep then wakes — forces Meta runtime to re-register controllers
+document.getElementById('btn-sleep').onclick = () => {
+  if (!xrSession) return;
+  log('Putting session to sleep — put on headset and press power once…');
+  // End session, re-enter after 1.5s (mimics sleep/wake cycle in software)
+  xrSession.end().then(() => {
+    setTimeout(() => {
+      log('Re-entering session after sleep cycle…');
+      startXR();
+    }, 1500);
+  });
+};
+
+document.getElementById('btn-stop').onclick = () => { if (xrSession) xrSession.end(); };
+
+/* ─── Per-frame controller read ─────────────────────────────────── */
+function readController(frame, src) {
+  // Prefer gripSpace (gives wrist/grip pose), fall back to targetRaySpace
+  const space = src.gripSpace ?? src.targetRaySpace;
+  if (!space) return null;
+  const pose = frame.getPose(space, refSpace);
+  if (!pose) return null;
+
+  const t  = pose.transform;
+  const gp = src.gamepad;
+  return {
+    pos:        [t.position.x,    t.position.y,    t.position.z],
+    quat:       [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w],
+    hasGrip:    !!src.gripSpace,
+    trigger:    gp?.buttons[0]?.value   ?? 0,
+    grip:       gp?.buttons[1]?.value   ?? 0,
+    thumbstick: gp?.axes ? [gp.axes[2] ?? 0, gp.axes[3] ?? 0] : [0, 0],
+    btn_a:      gp?.buttons[4]?.pressed ?? false,
+    btn_b:      gp?.buttons[5]?.pressed ?? false,
+  };
+}
+
+/* ─── XR frame loop ─────────────────────────────────────────────── */
+function onFrame(ts, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(onFrame);
+
+  /* ══════════════════════════════════════════════════════════════
+     REQUIRED: clear the WebGL framebuffer every frame.
+     Skipping this can cause the runtime to stall input processing.
+  ══════════════════════════════════════════════════════════════ */
+  const baseLayer = session.renderState.baseLayer;
+  if (baseLayer) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
+    gl.viewport(0, 0, baseLayer.framebufferWidth, baseLayer.framebufferHeight);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);   // transparent black (AR passthrough)
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  }
+
+  // Read controllers
+  let left = null, right = null;
+  const nSrc = session.inputSources.length;
+
+  for (const src of session.inputSources) {
+    if (src.handedness === 'left')  left  = readController(frame, src);
+    if (src.handedness === 'right') right = readController(frame, src);
+  }
+
+  // Status dot
+  if (left || right) {
+    setDot('d-ctrl', 'ok');
+    setText('l-ctrl', `Controllers: tracking (${nSrc} sources)`);
+  } else {
+    setDot('d-ctrl', nSrc > 0 ? 'warn' : '');
+    setText('l-ctrl', nSrc > 0
+      ? `${nSrc} source(s) found but no poses yet — squeeze harder`
+      : 'Controllers: not detected — squeeze both grips');
+  }
+
+  // Update 2D display (visible before/after session, not during immersive-vr)
+  if (left)  setText('p-left',
+    `L pos : [${left.pos.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  quat: [${left.quat.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  grip:${left.grip.toFixed(2)}  gripSpace:${left.hasGrip}`);
+  if (right) setText('p-right',
+    `R pos : [${right.pos.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  quat: [${right.quat.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  trig:${right.trigger.toFixed(2)}  gripSpace:${right.hasGrip}`);
+
+  // Rate-limited WebSocket send
+  if (ws?.readyState === WebSocket.OPEN && (ts - lastSendTs) >= SEND_INTERVAL) {
+    ws.send(JSON.stringify({ left, right, ts }));
+    lastSendTs = ts;
+    sendCount++;
+  }
+}
+
+/* ─── Boot ──────────────────────────────────────────────────────── */
+connectWS();
+log('Page loaded');
+</script>
+</body>
+</html>
+

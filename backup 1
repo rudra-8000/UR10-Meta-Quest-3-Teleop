@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UR10 Quest Teleop</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9;
+           display: flex; flex-direction: column; align-items: center; padding: 20px; }
+    h1   { color: #58a6ff; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 15px; margin: 8px 0; width: 360px; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #f85149; flex-shrink: 0; }
+    .dot.ok   { background: #3fb950; }
+    .dot.warn { background: #d29922; }
+    button { background: #238636; color: #fff; border: none; border-radius: 6px;
+             padding: 10px 16px; margin: 4px; font-size: 14px; cursor: pointer; width: 100%; }
+    button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+    button.red { background: #da3633; }
+    pre { font-size: 11px; color: #8b949e; line-height: 1.5; margin: 6px 0; }
+    #log { max-height: 100px; overflow-y: auto; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>UR10 Quest Teleop</h1>
+
+  <div class="card">
+    <div class="row"><div class="dot" id="d-ws"></div><span id="l-ws">WebSocket: connecting…</span></div>
+    <div class="row"><div class="dot" id="d-xr"></div><span id="l-xr">XR: not started</span></div>
+    <div class="row"><div class="dot warn" id="d-ctrl"></div><span id="l-ctrl">Controllers: waiting…</span></div>
+  </div>
+
+  <div class="card">
+    <button id="btn-xr">▶ Enter AR / VR</button>
+    <button id="btn-stop" class="red" disabled>■ End session</button>
+  </div>
+
+  <div class="card">
+    <strong>Live poses</strong>
+    <pre id="p-left">Left:  —</pre>
+    <pre id="p-right">Right: —</pre>
+  </div>
+
+  <div class="card">
+    <strong>Controls (robot-side)</strong>
+    <pre>Left  GRIP  (press)  → Calibrate reference / Reset
+Right TRIGGER (hold) → Robot tracks right controller</pre>
+  </div>
+
+  <div class="card"><strong>Log</strong><div id="log"></div></div>
+
+<script>
+const WS_URL        = `wss://${window.location.host}/ws`;
+const SEND_INTERVAL = 1000 / 90;
+
+let ws         = null;
+let xrSession  = null;
+let refSpace   = null;
+let lastSendTs = 0;
+
+function setDot(id, cls) {
+  document.getElementById(id).className = 'dot' + (cls ? ' ' + cls : '');
+}
+function setText(id, txt) { document.getElementById(id).textContent = txt; }
+function log(msg) {
+  const el = document.getElementById('log');
+  const t  = new Date().toLocaleTimeString();
+  el.innerHTML = `<div>[${t}] ${msg}</div>` + el.innerHTML.slice(0, 2000);
+}
+
+/* ─── WebSocket ──────────────────────────────────────────────────── */
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen  = () => { setDot('d-ws','ok'); setText('l-ws','WebSocket: connected');
+                       document.getElementById('btn-xr').disabled = false; log('WS connected'); };
+  ws.onclose = () => { setDot('d-ws',''); setText('l-ws','WebSocket: reconnecting…');
+                       document.getElementById('btn-xr').disabled = true;
+                       setTimeout(connectWS, 2000); };
+  ws.onerror = () => log('WS error');
+}
+
+/* ─── XR session ─────────────────────────────────────────────────── */
+document.getElementById('btn-xr').onclick = async () => {
+  if (!navigator.xr) { log('WebXR not available'); return; }
+
+  // ← KEY FIX 1: prefer immersive-vr; Quest 3 AR mode is flaky for controllers
+  const modes = ['immersive-vr', 'immersive-ar'];
+  let mode = null;
+  for (const m of modes) {
+    if (await navigator.xr.isSessionSupported(m)) { mode = m; break; }
+  }
+  if (!mode) { log('No immersive XR mode supported'); return; }
+
+  try {
+    xrSession = await navigator.xr.requestSession(mode, {
+      requiredFeatures: ['local-floor'],
+      // ← KEY FIX 2: hand-tracking optional helps Quest 3 register controllers
+      optionalFeatures: ['hand-tracking', 'bounded-floor'],
+    });
+  } catch(e1) {
+    log(`local-floor failed (${e1.message}), retrying with local…`);
+    try {
+      xrSession = await navigator.xr.requestSession(mode, {
+        requiredFeatures: ['local'],
+        optionalFeatures: ['hand-tracking'],
+      });
+    } catch(e2) { log('XR session failed: ' + e2.message); return; }
+  }
+
+  try {
+    refSpace = await xrSession.requestReferenceSpace('local-floor');
+    log('Reference space: local-floor');
+  } catch(_) {
+    refSpace = await xrSession.requestReferenceSpace('local');
+    log('Reference space: local (floor unavailable)');
+  }
+
+  // ← KEY FIX 3: listen for late-registering controllers
+  xrSession.addEventListener('inputsourceschange', (ev) => {
+    log(`inputsourceschange: +${ev.added.length} / -${ev.removed.length} ` +
+        `(total: ${xrSession.inputSources.length})`);
+    for (const src of ev.added) {
+      log(`  ✓ ${src.handedness} | mode:${src.targetRayMode} | ${src.profiles[0] ?? 'unknown'}`);
+    }
+  });
+
+  xrSession.addEventListener('end', () => {
+    setDot('d-xr',''); setText('l-xr','XR: ended');
+    document.getElementById('btn-xr').disabled   = false;
+    document.getElementById('btn-stop').disabled = true;
+    xrSession = null; refSpace = null;
+    log('XR session ended');
+  });
+
+  setDot('d-xr','ok');
+  setText('l-xr', `XR: ${mode}`);
+  document.getElementById('btn-xr').disabled   = true;
+  document.getElementById('btn-stop').disabled = false;
+  log(`Session started (${mode}) — *** SQUEEZE BOTH CONTROLLERS NOW ***`);
+  xrSession.requestAnimationFrame(onFrame);
+};
+
+document.getElementById('btn-stop').onclick = () => { if (xrSession) xrSession.end(); };
+
+/* ─── Per-frame controller read ─────────────────────────────────── */
+function readController(frame, src) {
+  // Fall back to targetRaySpace if gripSpace unavailable
+  const space = src.gripSpace ?? src.targetRaySpace;
+  if (!space) return null;
+  const pose = frame.getPose(space, refSpace);
+  if (!pose) return null;
+  const t  = pose.transform;
+  const gp = src.gamepad;
+  return {
+    pos:        [t.position.x,    t.position.y,    t.position.z],
+    quat:       [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w],
+    hasGrip:    !!src.gripSpace,             // ← tells you which space was used
+    trigger:    gp?.buttons[0]?.value   ?? 0,
+    grip:       gp?.buttons[1]?.value   ?? 0,
+    thumbstick: gp?.axes ? [gp.axes[2] ?? 0, gp.axes[3] ?? 0] : [0, 0],
+    btn_a:      gp?.buttons[4]?.pressed ?? false,
+    btn_b:      gp?.buttons[5]?.pressed ?? false,
+  };
+}
+
+function onFrame(ts, frame) {
+  const session = frame.session;
+  session.requestAnimationFrame(onFrame);
+
+  let left = null, right = null;
+  const nSources = session.inputSources.length;   // ← debug count
+
+  for (const src of session.inputSources) {
+    if (src.handedness === 'left')  left  = readController(frame, src);
+    if (src.handedness === 'right') right = readController(frame, src);
+  }
+
+  const hasCtrl = left !== null || right !== null;
+  setDot('d-ctrl', hasCtrl ? 'ok' : (nSources > 0 ? 'warn' : ''));
+  // ← shows source count so you can see if Quest registers them at all
+  setText('l-ctrl',
+    hasCtrl
+      ? `Controllers: tracking (${nSources} sources)`
+      : `Controllers: waiting… (${nSources} sources found, no poses yet)`
+  );
+
+  if (left)  document.getElementById('p-left').textContent =
+    `L pos : [${left.pos.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  quat: [${left.quat.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  grip:${left.grip.toFixed(2)}  gripSpace:${left.hasGrip}  X:${left.btn_a?'■':'□'}  Y:${left.btn_b?'■':'□'}`;
+  if (right) document.getElementById('p-right').textContent =
+    `R pos : [${right.pos.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  quat: [${right.quat.map(v=>v.toFixed(3)).join(', ')}]\n` +
+    `  trig:${right.trigger.toFixed(2)}  gripSpace:${right.hasGrip}  A:${right.btn_a?'■':'□'}  B:${right.btn_b?'■':'□'}`;
+
+  if (ws?.readyState === WebSocket.OPEN && (ts - lastSendTs) >= SEND_INTERVAL) {
+    ws.send(JSON.stringify({ left, right, ts }));
+    lastSendTs = ts;
+  }
+}
+
+connectWS();
+log('Page loaded — open in Quest Meta Browser over HTTPS');
+</script>
+
+</body>
+</html>

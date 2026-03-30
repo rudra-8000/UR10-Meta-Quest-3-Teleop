@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UR10 Quest Teleop</title>
+  <style>
+    * { box-sizing: border-box; }
+    body  { font-family: monospace; background: #0d1117; color: #c9d1d9;
+            display: flex; flex-direction: column; align-items: center;
+            padding: 16px; margin: 0; }
+    h1    { color: #58a6ff; margin: 8px 0; font-size: 18px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 12px; margin: 6px 0; width: 360px; }
+    .row  { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+    .dot  { width: 10px; height: 10px; border-radius: 50%; background: #f85149; flex-shrink: 0; }
+    .dot.ok   { background: #3fb950; }
+    .dot.warn { background: #d29922; }
+    button           { background: #238636; color: #fff; border: none; border-radius: 6px;
+                       padding: 9px 14px; margin: 3px; font-size: 13px; cursor: pointer; width: 100%; }
+    button:disabled  { background: #30363d; color: #8b949e; cursor: not-allowed; }
+    button.red  { background: #da3633; }
+    button.blue { background: #1f6feb; }
+    pre   { font-size: 11px; color: #8b949e; line-height: 1.5; margin: 4px 0; }
+    #log  { max-height: 110px; overflow-y: auto; font-size: 11px; }
+
+    /* ── In-headset HUD ─────────────────────────────────────────── */
+    #hud {
+      display: none;
+      position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.72); color: #fff; font-family: monospace;
+      font-size: 20px; padding: 14px 22px; border-radius: 10px;
+      border: 2px solid #58a6ff; text-align: center; z-index: 9999;
+      min-width: 320px; line-height: 1.9; pointer-events: none;
+    }
+    #hud .big  { font-size: 26px; font-weight: bold; }
+    #hud .ok   { color: #3fb950; }
+    #hud .warn { color: #d29922; }
+    #hud .err  { color: #f85149; }
+
+    /* Three.js canvas — full screen, behind HUD */
+    #three-canvas {
+      display: none;
+      position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      z-index: 0;
+    }
+  </style>
+</head>
+<body>
+
+<h1>UR10 Quest Teleop</h1>
+
+<div class="card">
+  <div class="row"><div class="dot" id="d-ws"></div><span id="l-ws">WebSocket: connecting…</span></div>
+  <div class="row"><div class="dot" id="d-rv"></div><span id="l-rv">Robot viz: connecting…</span></div>
+  <div class="row"><div class="dot" id="d-xr"></div><span id="l-xr">XR: not started</span></div>
+  <div class="row"><div class="dot" id="d-ctrl"></div><span id="l-ctrl">Controllers: waiting…</span></div>
+  <div class="row" style="margin-top:6px">
+    <span style="font-size:12px;color:#8b949e">Sends/s: </span>
+    <span id="hz" style="font-size:12px;color:#58a6ff">0</span>
+  </div>
+</div>
+
+<div class="card">
+  <button id="btn-ar">▶ Enter AR (overlay + robot viz)</button>
+  <button id="btn-vr" class="blue">▶ Enter VR (robot viz, no passthrough)</button>
+  <button id="btn-stop" class="red" disabled>■ Exit session</button>
+</div>
+
+<div class="card">
+  <pre id="p-left">Left:  —</pre>
+  <pre id="p-right">Right: —</pre>
+  <pre id="p-robot">Robot: —</pre>
+</div>
+
+<div class="card">
+  <strong>Controls</strong>
+  <pre>Left  GRIP  → Calibrate / Reset
+Left  TRIG  → Home robot
+Right GRIP  → Track (hold)
+Right TRIG  → Toggle gripper</pre>
+</div>
+
+<div class="card"><strong>Log</strong><div id="log"></div></div>
+
+<!-- In-headset HUD overlay -->
+<div id="hud">
+  <div class="big" id="hud-mode">● IDLE</div>
+  <div id="hud-ctrl">Controllers: —</div>
+  <div id="hud-tcp" style="font-size:14px;color:#8b949e">TCP: —</div>
+</div>
+
+<!-- Hidden WebGL canvas for XRWebGLLayer -->
+<canvas id="xr-canvas" style="display:none;width:1px;height:1px;"></canvas>
+
+<!-- Three.js from CDN -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ════════════════════════════════════════════════════════════════════
+   CONFIG
+════════════════════════════════════════════════════════════════════ */
+const WS_URL       = `wss://${location.host}/ws`;
+const ROBOT_WS_URL = `wss://${location.host}/robot_ws`;
+const SEND_INTERVAL = 1000 / 90;
+
+/* ─── UR10 DH parameters (modified DH, metres/radians) ─────────────
+   [a,  d,  alpha]   — theta is the joint variable added at runtime
+   Source: Universal Robots UR10 datasheet
+*/
+const UR10_DH = [
+  { a: 0,       d: 0.1273, alpha:  Math.PI/2 },   // joint 0 → 1
+  { a:-0.6120,  d: 0,      alpha:  0         },   // joint 1 → 2
+  { a:-0.5723,  d: 0,      alpha:  0         },   // joint 2 → 3
+  { a: 0,       d: 0.1639, alpha:  Math.PI/2 },   // joint 3 → 4
+  { a: 0,       d: 0.1157, alpha: -Math.PI/2 },   // joint 4 → 5
+  { a: 0,       d: 0.0922, alpha:  0         },   // joint 5 → TCP
+];
+
+// Joint home angles (must match HOME_JOINTS in server)
+const HOME_Q = [0, -Math.PI/2, Math.PI/2, -Math.PI/2, -Math.PI/2, 0];
+
+/* ════════════════════════════════════════════════════════════════════
+   THREE.JS SCENE
+════════════════════════════════════════════════════════════════════ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+renderer.domElement.id = 'three-canvas';
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+// Lighting
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(1, 2, 1);
+scene.add(dirLight);
+
+/* ── Robot base pivot — place it ~1 m in front, at table height ─── */
+// User adjusts this to align the virtual twin with the real robot.
+// x=0 = user centre, y = height, z = distance in front (negative = forward in Three.js)
+const ROBOT_ORIGIN = new THREE.Vector3(0, -0.3, -1.2);   // tweak to taste
+
+const robotRoot = new THREE.Group();
+robotRoot.position.copy(ROBOT_ORIGIN);
+// UR base Z-up → Three.js Y-up: rotate -90° around X
+robotRoot.rotation.x = -Math.PI / 2;
+scene.add(robotRoot);
+
+/* ── Link geometry builders ─────────────────────────────────────── */
+const MAT_LINK   = new THREE.MeshPhongMaterial({ color: 0x2a5caa, transparent: true, opacity: 0.85 });
+const MAT_JOINT  = new THREE.MeshPhongMaterial({ color: 0xdddddd });
+const MAT_TCP    = new THREE.MeshPhongMaterial({ color: 0x3fb950, transparent: true, opacity: 0.9 });
+const MAT_GHOST  = new THREE.MeshPhongMaterial({ color: 0xf0a020, transparent: true, opacity: 0.55, wireframe: false });
+const MAT_BASE   = new THREE.MeshPhongMaterial({ color: 0x444444 });
+const MAT_AXIS_X = new THREE.MeshBasicMaterial({ color: 0xff4444 });
+const MAT_AXIS_Z = new THREE.MeshBasicMaterial({ color: 0x44ff44 });
+
+function makeCylinder(r, h, mat) {
+  const g = new THREE.CylinderGeometry(r, r, h, 16);
+  return new THREE.Mesh(g, mat);
+}
+function makeSphere(r, mat) {
+  const g = new THREE.SphereGeometry(r, 16, 12);
+  return new THREE.Mesh(g, mat);
+}
+function makeBox(w, h, d, mat) {
+  return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+}
+
+/* ── Robot base ─────────────────────────────────────────────────── */
+const baseBox = makeBox(0.22, 0.22, 0.12, MAT_BASE);
+baseBox.position.y = 0.06;
+robotRoot.add(baseBox);
+
+/* ── Build 6 joint groups + link meshes ────────────────────────────
+   Each jointGroup[i] is the pivot for joint i+1.
+   linkMesh[i] is the visible cylinder between joint i and i+1.
+*/
+const jointGroups = [];
+const jointSpheres = [];
+
+// Link lengths (metres) — distance from joint i to joint i+1 along the link
+// For UR10: mostly |a| values from DH; d values are axial
+const LINK_VIS = [
+  { len: 0.13,  r: 0.055 },   // base → shoulder
+  { len: 0.612, r: 0.042 },   // shoulder → elbow
+  { len: 0.572, r: 0.038 },   // elbow → wrist1
+  { len: 0.12,  r: 0.032 },   // wrist1 → wrist2
+  { len: 0.116, r: 0.030 },   // wrist2 → wrist3
+  { len: 0.09,  r: 0.028 },   // wrist3 → TCP
+];
+
+let parent = robotRoot;
+for (let i = 0; i < 6; i++) {
+  const g = new THREE.Group();
+  parent.add(g);
+  jointGroups.push(g);
+
+  // Joint sphere
+  const js = makeSphere(0.048, MAT_JOINT);
+  g.add(js);
+  jointSpheres.push(js);
+
+  // Link cylinder (child of jointGroup, offset along Y by half its length)
+  const lv = LINK_VIS[i];
+  const lc = makeCylinder(lv.r * 0.7, lv.len, MAT_LINK);
+  lc.position.y = lv.len / 2;
+  g.add(lc);
+
+  parent = g;
+}
+
+/* ── TCP marker ─────────────────────────────────────────────────── */
+const tcpMarker = makeSphere(0.04, MAT_TCP);
+// Add XYZ axes at TCP
+const axX = makeCylinder(0.005, 0.12, MAT_AXIS_X); axX.rotation.z = -Math.PI/2; axX.position.x = 0.06;
+const axZ = makeCylinder(0.005, 0.12, MAT_AXIS_Z); axZ.position.y = 0.06;
+tcpMarker.add(axX, axZ);
+scene.add(tcpMarker);   // added to scene (world space), positioned by FK
+
+/* ── Right controller ghost sphere ─────────────────────────────── */
+const ctrlGhost = makeSphere(0.035, MAT_GHOST);
+ctrlGhost.visible = false;
+scene.add(ctrlGhost);
+
+// Controller rays
+const rayMat  = new THREE.LineBasicMaterial({ color: 0xf0a020, transparent: true, opacity: 0.6 });
+const rayGeo  = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-0.3)]);
+const ctrlRay = new THREE.Line(rayGeo, rayMat);
+ctrlRay.visible = false;
+scene.add(ctrlRay);
+
+/* ── Workspace boundary box (wireframe) ─────────────────────────── */
+const wsGeo = new THREE.BoxGeometry(1.8, 1.05, 1.8);
+const wsEdges = new THREE.EdgesGeometry(wsGeo);
+const wsMat = new THREE.LineBasicMaterial({ color: 0x334455, transparent: true, opacity: 0.3 });
+const wsBox = new THREE.LineSegments(wsEdges, wsMat);
+// Centre of clamp box in UR base frame: x=[−0.9,0.9] y=[−0.9,0.9] z=[0.05,1.1]
+// → in Three.js (Y-up after robotRoot rotation): offset by half-size
+wsBox.position.set(0, 0.575, 0);   // 0.05 + 1.05/2 in Z→Y
+robotRoot.add(wsBox);
+
+/* ── Grid floor ─────────────────────────────────────────────────── */
+const grid = new THREE.GridHelper(4, 20, 0x334455, 0x223344);
+grid.position.y = -0.31;
+scene.add(grid);
+
+/* ════════════════════════════════════════════════════════════════════
+   FORWARD KINEMATICS  (DH → Three.js transform)
+════════════════════════════════════════════════════════════════════ */
+function dhMatrix(a, d, alpha, theta) {
+  // Standard DH transform T = Rz(theta) * Tz(d) * Tx(a) * Rx(alpha)
+  const ct = Math.cos(theta), st = Math.sin(theta);
+  const ca = Math.cos(alpha), sa = Math.sin(alpha);
+  const m = new THREE.Matrix4();
+  m.set(
+    ct,  -st*ca,   st*sa,   a*ct,
+    st,   ct*ca,  -ct*sa,   a*st,
+     0,      sa,      ca,      d,
+     0,       0,       0,      1
+  );
+  return m;
+}
+
+function applyFK(joints) {
+  // joints: array of 6 angles in radians
+  // Positions each jointGroup so the visual matches the real robot
+  let cumMat = new THREE.Matrix4();   // relative to robotRoot
+
+  const pos  = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+  const scl  = new THREE.Vector3();
+
+  for (let i = 0; i < 6; i++) {
+    const { a, d, alpha } = UR10_DH[i];
+    const theta = joints[i];
+    const T = dhMatrix(a, d, alpha, theta);
+    cumMat.multiply(T);
+
+    // Decompose cumulative transform
+    cumMat.decompose(pos, quat, scl);
+
+    // Position jointGroup in robotRoot space
+    jointGroups[i].position.copy(pos);
+    jointGroups[i].quaternion.copy(quat);
+
+    // Reset local children (we set world transforms, not local)
+    // Actually: place each group in world space via robotRoot
+  }
+
+  // TCP world position
+  const tcpDH = dhMatrix(0, UR10_DH[5].d, 0, 0);
+  cumMat.multiply(tcpDH);
+  cumMat.decompose(pos, quat, scl);
+
+  // Convert to world (robotRoot applies rotation)
+  tcpMarker.position.setFromMatrixPosition(cumMat.clone().premultiply(robotRoot.matrixWorld));
+  tcpMarker.quaternion.setFromRotationMatrix(cumMat.clone().premultiply(robotRoot.matrixWorld));
+}
+
+// Apply home pose on load
+applyFK(HOME_Q);
+
+/* ════════════════════════════════════════════════════════════════════
+   WEBSOCKET: controller data  (Quest → Python → Quest loop)
+════════════════════════════════════════════════════════════════════ */
+let ws         = null;
+let lastSendTs = 0;
+let sendCount  = 0;
+let hzTimer    = null;
+
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen  = () => { setDot('d-ws','ok'); setText('l-ws','WebSocket: connected');
+                       document.getElementById('btn-ar').disabled = false;
+                       document.getElementById('btn-vr').disabled = false; log('WS connected'); };
+  ws.onclose = () => { setDot('d-ws',''); setText('l-ws','WebSocket: reconnecting…');
+                       document.getElementById('btn-ar').disabled = true;
+                       document.getElementById('btn-vr').disabled = true;
+                       setTimeout(connectWS, 2000); };
+  ws.onerror = () => log('WS error');
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   WEBSOCKET: robot state  (Python → Quest)
+════════════════════════════════════════════════════════════════════ */
+let robotWs   = null;
+let lastJoints = [...HOME_Q];
+
+function connectRobotWS() {
+  robotWs = new WebSocket(ROBOT_WS_URL);
+  robotWs.onopen  = () => { setDot('d-rv','ok'); setText('l-rv','Robot viz: connected'); };
+  robotWs.onclose = () => { setDot('d-rv',''); setText('l-rv','Robot viz: reconnecting…');
+                            setTimeout(connectRobotWS, 2000); };
+  robotWs.onerror = () => {};
+  robotWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.joints) {
+        lastJoints = d.joints;
+        applyFK(d.joints);
+        if (d.tcp) {
+          const t = d.tcp;
+          setText('p-robot',
+            `TCP: [${t.slice(0,3).map(v=>v.toFixed(3)).join(', ')}]\n` +
+            `Ori: [${t.slice(3,6).map(v=>v.toFixed(3)).join(', ')}]\n` +
+            `Mode: ${d.mode ?? '?'}`);
+          // Update HUD
+          document.getElementById('hud-tcp').textContent =
+            `TCP [${t[0].toFixed(2)}, ${t[1].toFixed(2)}, ${t[2].toFixed(2)}]  ${d.mode}`;
+        }
+      }
+    } catch(_) {}
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   XR SESSION
+════════════════════════════════════════════════════════════════════ */
+const gl = renderer.domElement;   // Three.js manages the GL context
+let xrSession      = null;
+let refSpace       = null;
+let domOverlay     = false;
+
+const hud = document.getElementById('hud');
+
+document.getElementById('btn-ar').onclick = () => startXR('ar');
+document.getElementById('btn-vr').onclick = () => startXR('vr');
+document.getElementById('btn-stop').onclick = () => xrSession?.end();
+
+async function startXR(prefer) {
+  if (!navigator.xr) { log('WebXR not supported'); return; }
+
+  let mode, opts;
+  if (prefer === 'ar' && await navigator.xr.isSessionSupported('immersive-ar')) {
+    mode = 'immersive-ar';
+    opts = {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['dom-overlay', 'hand-tracking'],
+      domOverlay:       { root: document.body },
+    };
+  } else {
+    mode = 'immersive-vr';
+    if (!await navigator.xr.isSessionSupported('immersive-vr')) {
+      log('No XR mode supported'); return;
+    }
+    opts = {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['hand-tracking'],
+    };
+  }
+
+  for (const rf of ['local-floor', 'local']) {
+    try {
+      opts.requiredFeatures = [rf];
+      xrSession = await navigator.xr.requestSession(mode, opts);
+      log(`Session: ${mode} / ${rf}`);
+      break;
+    } catch(e) {
+      if (rf === 'local') { log('Session failed: ' + e.message); return; }
+    }
+  }
+
+  domOverlay = xrSession.domOverlayState?.type != null;
+  log(`dom-overlay: ${domOverlay ? xrSession.domOverlayState.type : 'off'}`);
+
+  // Let Three.js manage the XR session + rendering
+  await renderer.xr.setSession(xrSession);
+
+  try {
+    refSpace = await xrSession.requestReferenceSpace('local-floor');
+  } catch(_) {
+    refSpace = await xrSession.requestReferenceSpace('local');
+  }
+
+  xrSession.addEventListener('inputsourceschange', (ev) => {
+    log(`inputsourceschange: +${ev.added.length} / -${ev.removed.length} total:${xrSession.inputSources.length}`);
+    for (const s of ev.added) log(`  ✓ [${s.handedness}] ${s.profiles[0] ?? '?'}`);
+  });
+  xrSession.addEventListener('selectstart', ev => log(`selectstart: ${ev.inputSource.handedness}`));
+
+  xrSession.addEventListener('end', () => {
+    hud.style.display = 'none';
+    domOverlay = false;
+    setDot('d-xr',''); setText('l-xr','XR: ended');
+    document.getElementById('btn-stop').disabled = true;
+    document.getElementById('btn-ar').disabled   = false;
+    document.getElementById('btn-vr').disabled   = false;
+    clearInterval(hzTimer);
+    log('Session ended');
+  });
+
+  if (domOverlay) { hud.style.display = 'block'; }
+
+  setDot('d-xr','ok'); setText('l-xr', `XR: ${mode}${domOverlay ? ' +overlay' : ''}`);
+  document.getElementById('btn-stop').disabled = false;
+  document.getElementById('btn-ar').disabled   = true;
+  document.getElementById('btn-vr').disabled   = true;
+
+  hzTimer = setInterval(() => { setText('hz', sendCount); sendCount = 0; }, 1000);
+  log('*** Squeeze both controllers ***');
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   CONTROLLER READ HELPER
+════════════════════════════════════════════════════════════════════ */
+function readController(frame, src) {
+  const space = src.gripSpace ?? src.targetRaySpace;
+  if (!space) return null;
+  const pose = frame.getPose(space, refSpace);
+  if (!pose) return null;
+  const t = pose.transform, gp = src.gamepad;
+  return {
+    pos:        [t.position.x,    t.position.y,    t.position.z],
+    quat:       [t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w],
+    hasGrip:    !!src.gripSpace,
+    trigger:    gp?.buttons[0]?.value   ?? 0,
+    grip:       gp?.buttons[1]?.value   ?? 0,
+    thumbstick: [gp?.axes?.[2] ?? 0, gp?.axes?.[3] ?? 0],
+    btn_a:      gp?.buttons[4]?.pressed ?? false,
+    btn_b:      gp?.buttons[5]?.pressed ?? false,
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   THREE.JS RENDER LOOP  (called by renderer.xr every frame)
+════════════════════════════════════════════════════════════════════ */
+renderer.setAnimationLoop((ts, frame) => {
+  if (!frame || !xrSession || !refSpace) {
+    renderer.render(scene, camera);
+    return;
+  }
+
+  // Update camera from XR
+  const pose = frame.getViewerPose(refSpace);
+  if (pose) {
+    const v = pose.views[0];
+    camera.matrix.fromArray(v.transform.matrix);
+    camera.matrix.decompose(camera.position, camera.quaternion, camera.scale);
+    camera.projectionMatrix.fromArray(v.projectionMatrix);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  }
+
+  // Read controllers
+  let left = null, right = null;
+  const nSrc = xrSession.inputSources.length;
+
+  for (const src of xrSession.inputSources) {
+    if (src.handedness === 'left')  left  = readController(frame, src);
+    if (src.handedness === 'right') right = readController(frame, src);
+  }
+
+  // Update controller ghost in 3D
+  if (right) {
+    ctrlGhost.visible = true;
+    ctrlGhost.position.set(...right.pos);
+    ctrlGhost.quaternion.set(...right.quat);
+    ctrlRay.visible  = true;
+    ctrlRay.position.set(...right.pos);
+    ctrlRay.quaternion.set(...right.quat);
+  } else {
+    ctrlGhost.visible = false;
+    ctrlRay.visible   = false;
+  }
+
+  // Status UI
+  const hasCtrl = !!(left || right);
+  setDot('d-ctrl', hasCtrl ? 'ok' : (nSrc > 0 ? 'warn' : ''));
+  setText('l-ctrl', hasCtrl
+    ? `Controllers: tracking ✓ (${nSrc})`
+    : (nSrc > 0 ? `${nSrc} src — squeeze harder` : 'Not detected'));
+
+  if (domOverlay) {
+    document.getElementById('hud-ctrl').textContent =
+      hasCtrl ? '🟢 Controllers tracking' : '🟡 Squeeze controllers';
+    document.getElementById('hud-ctrl').className = hasCtrl ? 'ok' : 'warn';
+  }
+
+  // Update 2D pose displays
+  if (left)  setText('p-left',
+    `L [${left.pos.map(v=>v.toFixed(3)).join(', ')}]  grip:${left.grip.toFixed(2)}`);
+  if (right) setText('p-right',
+    `R [${right.pos.map(v=>v.toFixed(3)).join(', ')}]  trig:${right.trigger.toFixed(2)}`);
+
+  // Send to Python
+  if (ws?.readyState === WebSocket.OPEN && (ts - lastSendTs) >= SEND_INTERVAL) {
+    ws.send(JSON.stringify({ left, right, ts }));
+    lastSendTs = ts;
+    sendCount++;
+  }
+
+  renderer.render(scene, camera);
+});
+
+/* ════════════════════════════════════════════════════════════════════
+   HELPERS
+════════════════════════════════════════════════════════════════════ */
+const setDot  = (id, cls) =>
+  document.getElementById(id).className = 'dot' + (cls ? ' ' + cls : '');
+const setText = (id, txt) => {
+  const el = document.getElementById(id);
+  if (el) el.textContent = txt;
+};
+function log(msg) {
+  const el = document.getElementById('log');
+  const t  = new Date().toLocaleTimeString();
+  el.innerHTML = `<div>[${t}] ${msg}</div>` + el.innerHTML.slice(0, 2400);
+  console.log(`[${t}] ${msg}`);
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ── Boot ──────────────────────────────────────────────────────────── */
+connectWS();
+connectRobotWS();
+log('Page loaded');
+</script>
+</body>
+</html>
+
